@@ -25,7 +25,8 @@
 22. [Полезные команды](#полезные-команды)
 23. [Best Practices для Senior разработчиков](#best-practices-для-senior-разработчиков)
 24. [Ссылки для дальнейшего изучения](#ссылки-для-дальнейшего-изучения)
-
+25. [Работа с пользователями](#работа-с-пользователями)
+26. [Миграции](#миграции)
 ## Основы PostgreSQL
 
 PostgreSQL (часто называемый "Postgres") — это мощная объектно-реляционная база данных с открытым исходным кодом.
@@ -58,6 +59,142 @@ psql -U username -d database_name -W
 ```
 postgresql://username:password@localhost:5432/database_name
 ```
+
+### Работа с пользователями
+
+Ниже кратко показано, как создавать пользователей PostgreSQL с паролем и без, как менять пароль и как создать базу данных, принадлежащую новому пользователю. Примеры универсальны для macOS/Unix. Замените плейсхолдеры в угловых скобках на ваши значения.
+
+Предпосылка: используйте роль с административными правами (например, `<SUPERUSER>` — это может быть `postgres` или ваш локальный пользователь, который обладает правами на создание БД/ролей). Для надёжности добавляем `-v ON_ERROR_STOP=1`, чтобы psql выходил при ошибке.
+
+1) Пользователь БЕЗ пароля
+- SQL:
+```
+CREATE USER appuser;
+```
+- Подходит, если локальная аутентификация настроена через peer/trust (см. pg_hba.conf). Иначе подключения могут требовать пароль.
+- Connection string (без пароля):
+```
+postgres://appuser@localhost:5432/postgress_guide?schema=public
+```
+
+2) Пользователь С паролем (рекомендовано)
+- Сгенерируйте пароль в переменную окружения (не печатаем его в консоль):
+```
+PGUSER_PASSWORD=$(openssl rand -base64 24)
+```
+- Создайте пользователя:
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE USER appuser WITH LOGIN PASSWORD '${PGUSER_PASSWORD}';"
+```
+- Создайте базу данных и назначьте владельца (см. п.4 для альтернатив):
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE DATABASE postgress_guide OWNER appuser;"
+```
+- Разрешения по умолчанию в public-схеме обычно достаточны; при необходимости:
+```
+psql -h localhost -U <SUPERUSER> -d postgress_guide -v ON_ERROR_STOP=1 \
+  -c "GRANT ALL ON SCHEMA public TO appuser;"
+```
+- Connection string (с паролем):
+```
+postgres://appuser:{{PGUSER_PASSWORD}}@localhost:5432/postgress_guide?schema=public
+```
+Если в пароле есть спецсимволы (`@`, `:`, `/`, `#`, и т.д.), URL-кодируйте пароль (например, `@` → `%40`).
+
+3) Смена пароля существующему пользователю
+- Сгенерируйте новый пароль:
+```
+NEW_PGUSER_PASSWORD=$(openssl rand -base64 24)
+```
+- Измените пароль:
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER USER appuser WITH PASSWORD '${NEW_PGUSER_PASSWORD}';"
+```
+- Обновите переменную окружения в `web/.env`:
+```
+DATABASE_URL="postgres://appuser:{{NEW_PGUSER_PASSWORD}}@localhost:5432/postgress_guide?schema=public"
+```
+
+4) Создание базы данных от имени нового пользователя
+- Вариант A (через суперпользователя; назначение владельца при создании):
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE DATABASE postgress_guide OWNER appuser;"
+```
+- Вариант B (если у appuser есть право CREATEDB, создайте БД от его имени):
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER ROLE appuser CREATEDB;"
+createdb -h localhost -U appuser postgress_guide
+```
+Connection string для обоих вариантов тот же, т.к. владелец — `appuser`:
+```
+# без пароля
+postgres://appuser@localhost:5432/postgress_guide?schema=public
+
+# с паролем
+postgres://appuser:{{PGUSER_PASSWORD}}@localhost:5432/postgress_guide?schema=public
+```
+
+5) Шпаргалка по connection string
+- Общий шаблон:
+```
+postgres://USERNAME[:PASSWORD]@HOST:PORT/DBNAME?schema=public
+```
+- Примеры:
+```
+# Локально без пароля (peer/trust)
+postgres://maximus@localhost:5432/postgress_guide?schema=public
+
+# Локально с паролем (пароль храните в .env)
+postgres://pguser:{{PGUSER_PASSWORD}}@localhost:5432/postgress_guide?schema=public
+```
+
+6) Удаление пользователя
+Удалять пользователя в PostgreSQL безопаснее по шагам, чтобы не остались «висящие» объекты и активные сессии.
+
+- Остановить активные сессии пользователя (подключён к любой БД):
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'appuser';"
+```
+
+- Переназначить (или удалить) объекты, принадлежащие пользователю, в каждой нужной базе данных:
+```
+# Переназначить все объекты на суперпользователя (или другого владельца)
+psql -h localhost -U <SUPERUSER> -d postgress_guide -v ON_ERROR_STOP=1 \
+  -c "REASSIGN OWNED BY appuser TO <SUPERUSER>;"
+
+# Удалить все привилегии и объекты, связанные с ролью в текущей БД
+psql -h localhost -U <SUPERUSER> -d postgress_guide -v ON_ERROR_STOP=1 \
+  -c "DROP OWNED BY appuser;"
+```
+Примечание: REASSIGN/DROP OWNED работают в рамках конкретной базы. Выполните эти команды в каждой БД, где у пользователя есть объекты/привилегии.
+
+- Если пользователь владеет базой данных, перед удалением роли смените владельца базы (или удалите базу):
+```
+# Сменить владельца БД
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER DATABASE postgress_guide OWNER TO <SUPERUSER>;"
+
+# Либо удалить БД, если она больше не нужна
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "DROP DATABASE postgress_guide;"
+```
+
+- Удалить роль:
+```
+psql -h localhost -U <SUPERUSER> -d postgres -v ON_ERROR_STOP=1 \
+  -c "DROP ROLE appuser;"
+```
+
+Советы безопасности:
+- Сначала убедитесь, что роль не используется приложениями (остановите сервисы или смените креды),
+- Сделайте бэкап важных данных,
+- Выполняйте REASSIGN OWNED в каждой базе, где роль что-то создавала.
 
 ## Основные команды psql
 
@@ -2303,6 +2440,156 @@ UPDATE products
 SET data = jsonb_set(data, '{price}', '899')
 WHERE data->>'name' = 'iPhone';
 ```
+
+## Миграции
+
+Зачем нужны миграции
+- Синхронизация схемы между средами (local/staging/prod) и разработчиками.
+- История эволюции БД под контролем версий: удобно ревьюить, катить вперёд/назад.
+- Повторяемость и автоматизация в CI/CD: предсказуемые деплои.
+- Аудит и соответствие требованиям (кто и что менял в схеме).
+
+Подходы к миграциям
+- Чистый SQL: вы пишете .sql-файлы, применяете их последовательно (psql -f ...). Максимальный контроль и совместимость.
+- Инструменты ORM (например, Prisma): генерация SQL на основе schema.prisma, удобные команды (migrate dev/deploy), встроенная таблица миграций.
+- Комбинированно: DDL через миграции, сложные data-migrations отдельными скриптами/процедурами.
+
+Пошаговый процесс (expand/contract)
+1) Спланировать изменение и обратимость.
+   - Для больших изменений используйте стратегию expand-and-contract: сначала расширяем схему, обеспечиваем обратную совместимость, затем сужаем (удаляем старое).
+2) Создать миграцию.
+   - SQL-подход: создайте файл в migrations/, например migrations/2025-10-04_add_users_table.sql.
+   - Prisma: измените prisma/schema.prisma и выполните:
+     ```bash
+     npx prisma migrate dev -n "add_users_table"
+     ```
+3) Пишем DDL с учётом блокировок.
+   - По возможности оборачивайте изменения в транзакцию:
+     ```sql
+     BEGIN;
+     ALTER TABLE users ADD COLUMN bio text;
+     COMMIT;
+     ```
+   - Исключения: операции CONCURRENTLY (индексы) нельзя внутри транзакции.
+4) Обеспечиваем совместимость кода.
+   - Разворачиваем код, который работает и со старой, и с новой схемой (feature flag/двойная запись/чтение из нового поля и fallback).
+5) Прогоняем локально, затем в staging.
+   - Настройте lock_timeout/statement_timeout, чтобы не «повесить» прод:
+     ```sql
+     SET lock_timeout = '5s';
+     SET statement_timeout = '5min';
+     ```
+6) Ревью и деплой.
+   - В проде применяйте минимальные по времени, безопасные миграции, вне пиковых часов.
+7) Наблюдаем, затем завершаем контракт (contract-этап):
+   - Удаляем старые поля/индексы, включаем NOT NULL и т.д., когда убеждены, что код полностью перешёл на новую схему.
+
+Примеры практических миграций (SQL)
+- Добавить NOT NULL столбец в большую таблицу (без долгой блокировки):
+  ```sql
+  -- 1) Добавить nullable столбец
+  ALTER TABLE orders ADD COLUMN customer_phone text;
+
+  -- 2) Постепенно заполнить (батчами из приложения или временным скриптом)
+  -- UPDATE orders SET customer_phone = ... WHERE customer_phone IS NULL LIMIT 10000;
+
+  -- 3) Задать DEFAULT (для новых строк)
+  ALTER TABLE orders ALTER COLUMN customer_phone SET DEFAULT '';
+
+  -- 4) Сделать NOT NULL (только когда все строки заполнены)
+  ALTER TABLE orders ALTER COLUMN customer_phone SET NOT NULL;
+  ```
+
+- Индекс без простоя:
+  ```sql
+  -- Создание индекса без долгого ACCESS EXCLUSIVE lock
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_created_at ON orders (created_at);
+
+  -- Удаление индекса также без простоя
+  DROP INDEX CONCURRENTLY IF EXISTS idx_orders_old;
+  ```
+
+- Внешний ключ «без боли»:
+  ```sql
+  -- Сначала индекс на referenced-колонку
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_id ON orders (user_id);
+
+  -- Добавляем constraint без немедленной проверки
+  ALTER TABLE orders
+    ADD CONSTRAINT orders_user_id_fkey
+    FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
+
+  -- Затем валидируем отдельно (короче блокировки)
+  ALTER TABLE orders VALIDATE CONSTRAINT orders_user_id_fkey;
+  ```
+
+- Переименование/перенос данных (expand/contract):
+  ```sql
+  -- expand: добавляем новое поле
+  ALTER TABLE users ADD COLUMN full_name text;
+  -- бэкуем/заливаем данные (из first_name/last_name)
+  -- затем код читает full_name при наличии, иначе старые поля
+
+  -- contract: когда код обновлён и данные перенесены
+  ALTER TABLE users DROP COLUMN first_name;
+  ALTER TABLE users DROP COLUMN last_name;
+  ```
+
+Таблица учёта миграций (для SQL-подхода)
+- Создайте таблицу schema_migrations:
+  ```sql
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    version text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+  );
+  ```
+- Каждая миграция имеет версию (метку времени/хэш). После успешного применения — вставляйте запись.
+
+Работа с Prisma миграциями
+- Локально:
+  ```bash
+  npx prisma migrate dev -n "feature_name"
+  ```
+  Эта команда создаст папку prisma/migrations/* с SQL и применит миграции к вашей БД.
+- Прод:
+  ```bash
+  npx prisma migrate deploy
+  ```
+  Применяет уже сгенерированные миграции без интерактива. Рекомендуется для CI/CD.
+- Проверяйте сгенерированный SQL и применяемые блокировки. Для сложных кейсов допускается вручную редактировать SQL миграции (но осторожно!).
+- Data-migrations делайте отдельными скриптами или в отдельных «безопасных» шагах (batch updates).
+
+Частые ошибки
+- Долгие блокировки из-за отсутствия CONCURRENTLY/NOT VALID/VALIDATE.
+- Тяжёлые миграции в пиковые часы.
+- ALTER TABLE с NOT NULL сразу по гигантской таблице без предварительного backfill.
+- Миграции без транзакций (или, наоборот, попытка завернуть CONCURRENTLY внутрь транзакции).
+- Отсутствие бэкапа/плана отката.
+- Отсутствие тестов/прогона на staging.
+- Непроверенные изменения типов (без USING или без промежуточной колонки).
+
+Лучшие практики
+- Декомпозируйте: одна миграция — одно логическое изменение.
+- Будьте идемпотентны: используйте IF EXISTS/IF NOT EXISTS, проверяйте состояние перед изменением.
+- Для FK: сначала индекс, затем CONSTRAINT ... NOT VALID, потом VALIDATE.
+- Для индексов: CREATE/DROP INDEX CONCURRENTLY.
+- Для больших таблиц: batched backfill, ANALYZE, контроль времени и нагрузки.
+- Используйте lock_timeout, statement_timeout в проде.
+- Следуйте стратегии expand-and-contract с фичефлагами.
+- Ревью SQL, тестирование на staging, мониторинг после выката.
+
+Шпаргалка команд
+- Чистый SQL:
+  ```bash
+  # применить миграцию из файла
+  psql -h localhost -U <SUPERUSER> -d <DB> -v ON_ERROR_STOP=1 -f migrations/2025-10-04_add_feature.sql
+  ```
+- Prisma:
+  ```bash
+  npx prisma migrate dev -n "add_feature"
+  npx prisma migrate deploy
+  npx prisma migrate resolve
+  ```
 
 ## Ссылки для дальнейшего изучения
 
